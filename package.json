@@ -1,0 +1,24 @@
+{
+  "name": "opencode-hermes-panel",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0",
+    "vite-plugin-solid": "^2.11.0",
+    "solid-js": "^1.9.0",
+    "typescript": "^5.0.0",
+    "electron": "^33.0.0",
+    "@types/node": "^22.0.0"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch"
+  }
+}
