@@ -196,7 +196,6 @@ export default Plugin.define({
 
     const endpoint = () => String(ctx.options.endpoint ?? DEFAULT_ENDPOINT)
     const key = () => String(ctx.options.key ?? "")
-    const tabKey = () => `${ctx.id}:${TAB_ID}`
     const store = ctx.stores.chat
 
     const [draft, setDraft] = createSignal("")
@@ -563,12 +562,12 @@ export default Plugin.define({
       }, { replace: true })
     }
 
-    const open = () => openDialog()
-
     // Keep a pinned tab in the side strip so Hermes is always discoverable; clicking it opens the dialog.
     const tab = {
       id: TAB_ID,
-      title: ctx.t("title"),
+      get title() {
+        return ctx.t("title")
+      },
       pinned: true,
       closable: false,
       fallback: true,
