@@ -24,6 +24,12 @@ export function uid(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+/** Decoded byte count of a base64 payload. */
+export function rawSize(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0
+  return Math.floor((base64.length * 3) / 4) - padding
+}
+
 /** Splits an SSE buffer into complete frames and the unfinished remainder. Handles LF and CRLF. */
 export function splitFrames(buffer: string): { frames: string[]; rest: string } {
   const parts = buffer.split(/\r?\n\r?\n/)
@@ -42,18 +48,36 @@ export function framePayloads(frame: string): string[] {
   return payloads
 }
 
-export type Delta = { content: string; reasoning: string }
+export type Delta = { content: string; reasoning: string; error: string }
 
-/** Reads one streaming chunk. Unknown shapes read as empty. */
+const EMPTY_DELTA: Delta = { content: "", reasoning: "", error: "" }
+
+/** Reads one streaming chunk. Unknown shapes read as empty; an error frame reports its message. */
 export function readDelta(payload: string): Delta {
-  let parsed: { choices?: { delta?: { content?: string; reasoning_content?: string } }[] }
+  let parsed: {
+    error?: { message?: unknown }
+    choices?: { delta?: { content?: string; reasoning_content?: string } }[]
+  }
   try {
     parsed = JSON.parse(payload)
   } catch {
-    return { content: "", reasoning: "" }
+    return EMPTY_DELTA
   }
+  const error = typeof parsed.error?.message === "string" ? parsed.error.message : ""
   const delta = parsed.choices?.[0]?.delta
-  return { content: delta?.content ?? "", reasoning: delta?.reasoning_content ?? "" }
+  return { content: delta?.content ?? "", reasoning: delta?.reasoning_content ?? "", error }
+}
+
+/** Appends a chunk to the carry and returns the deltas of every frame it completes. */
+export function readChunk(carry: string, piece: string): { rest: string; deltas: Delta[] } {
+  const { frames, rest } = splitFrames(carry + piece)
+  return { rest, deltas: frames.flatMap((frame) => framePayloads(frame).map(readDelta)) }
+}
+
+/** Reads the frames left in the carry when the stream ends. A last frame may arrive without its blank line. */
+export function flushChunk(carry: string): Delta[] {
+  if (!carry.trim()) return []
+  return framePayloads(carry).map(readDelta)
 }
 
 /** Non-streaming fallback: reads `choices[0].message.content` from a whole body. */
@@ -71,6 +95,11 @@ export function readMessage(body: string): string {
 /** Keeps a file body from closing its own `<file>` wrapper. */
 export function escapeFileTag(text: string): string {
   return text.replaceAll("</file>", "<\\/file>")
+}
+
+/** Keeps a file name from closing the wrapper's attribute. */
+export function escapeName(name: string): string {
+  return name.replace(/[<>"]/g, "_")
 }
 
 export type Prepared = { text: string; parts: Record<string, unknown>[] }
@@ -96,10 +125,10 @@ export function preparePrompt(
     if (isTextFile(file.name, file.mime) && budget > 0) {
       const body = escapeFileTag(decode(file.data).slice(0, budget))
       budget -= body.length
-      text += `\n\n<file name="${file.name}">\n${body}\n</file>`
+      text += `\n\n<file name="${escapeName(file.name)}">\n${body}\n</file>`
       continue
     }
-    text += `\n\n(attached binary file: ${file.name}, ${file.mime || "unknown type"})`
+    text += `\n\n(attached binary file: ${escapeName(file.name)}, ${file.mime || "unknown type"})`
   }
 
   return { text, parts }

@@ -1,21 +1,21 @@
 import { Schema } from "effect"
-import { Command, Ipc, MenuItem, Panel, Plugin, SettingsPage, Store } from "@opencode/plugin/gui"
-import { For, Show, createMemo, createSignal } from "solid-js"
+import { Command, Ipc, MenuItem, Plugin, SettingsPage, Store } from "@opencode/plugin/gui"
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
 import {
   MAX_ATTACHMENT_BYTES,
   MAX_FILES,
   MAX_TOTAL_BYTES,
+  flushChunk,
   preparePrompt,
-  framePayloads,
-  readDelta,
+  rawSize,
+  readChunk,
   readMessage,
-  splitFrames,
   titleFrom,
   uid,
   type Attachment,
+  type Delta,
 } from "./chat"
 
-const TAB_ID = "main"
 const DEFAULT_ENDPOINT = "https://katana-eu-hermes.hawiyat.cloud"
 
 // ---------------------------------------------------------------- schemas
@@ -58,10 +58,6 @@ type Thread = typeof ThreadSchema.Type
 
 // ---------------------------------------------------------------- ipc
 
-/**
- * The Ipc id must be the plugin id or start with `<plugin id>.`. The host assigns the
- * plugin id at runtime, so the token is built from `ctx.id` in both setups.
- */
 function chatIpc(pluginID: string) {
   return Ipc.define({
     id: `${pluginID}.chat`,
@@ -101,6 +97,10 @@ function readFile(file: File): Promise<Attachment> {
   })
 }
 
+function dataUrl(file: Attachment) {
+  return `data:${file.mime || "application/octet-stream"};base64,${file.data}`
+}
+
 // ---------------------------------------------------------------- components
 
 function Thinking(props: { text: string; label: string }) {
@@ -137,7 +137,7 @@ function Chip(props: { label: string; onRemove?: () => void }) {
         gap: "4px",
         "align-items": "center",
         "font-size": "11px",
-        padding: "1px 6px",
+        padding: "2px 8px",
         border: "1px solid rgba(127,127,127,0.3)",
         "border-radius": "999px",
         opacity: 0.85,
@@ -148,7 +148,7 @@ function Chip(props: { label: string; onRemove?: () => void }) {
         <button
           type="button"
           onClick={() => props.onRemove?.()}
-          style={{ background: "none", border: "none", color: "inherit", cursor: "pointer", padding: 0 }}
+          style={{ background: "none", border: "none", color: "inherit", cursor: "pointer", padding: 0, "font-size": "14px", "line-height": 1 }}
         >
           ×
         </button>
@@ -180,6 +180,7 @@ export default Plugin.define({
       needsSession: "Open a session first.",
       config: "Configured in opencode.json plugin options.",
       tooBig: "File is larger than 8 MB.",
+      tooLarge: "Attachments are larger than 24 MB.",
       tooMany: "Too many attachments.",
       readFailed: "Could not read the file.",
       emptyReply: "Hermes returned an empty reply.",
@@ -192,18 +193,25 @@ export default Plugin.define({
 
     const endpoint = () => String(ctx.options.endpoint ?? DEFAULT_ENDPOINT)
     const key = () => String(ctx.options.key ?? "")
-    const tabKey = () => `${ctx.id}:${TAB_ID}`
     const store = ctx.stores.chat
 
     const [draft, setDraft] = createSignal("")
     const [pending, setPending] = createSignal<Attachment[]>([])
-    const [busyID, setBusyID] = createSignal("")
-    const [liveText, setLiveText] = createSignal("")
-    const [liveReasoning, setLiveReasoning] = createSignal("")
+    const [live, setLive] = createSignal<Record<string, { text: string; reasoning: string }>>({})
+    const [busy, setBusy] = createSignal<Record<string, boolean>>({})
 
     const threads = createMemo(() => [...store.value.threads].sort((a, b) => b.updated - a.updated))
     const active = createMemo(() => store.value.threads.find((thread) => thread.id === store.value.active))
-    const busyHere = () => busyID() !== "" && busyID() === (active()?.id ?? "")
+    const activeID = () => active()?.id ?? ""
+
+    const liveOf = (id: string) => live()[id] ?? { text: "", reasoning: "" }
+    const busyOf = (id: string) => busy()[id] === true
+    const patchLive = (id: string, patch: (value: { text: string; reasoning: string }) => { text: string; reasoning: string }) => {
+      setLive({ ...live(), [id]: patch(liveOf(id)) })
+    }
+    const setBusyOf = (id: string, value: boolean) => {
+      setBusy({ ...busy(), [id]: value })
+    }
 
     const writeThreads = (next: readonly Thread[], activeID: string) => {
       store.set({ threads: [...next], active: activeID })
@@ -211,7 +219,7 @@ export default Plugin.define({
 
     const updateThread = (id: string, mutate: (thread: Thread) => Thread) => {
       writeThreads(
-        store.value.threads.map((thread) => (thread.id === id ? mutate(thread) : thread)),
+        store.value.threads.map((thread: Thread) => (thread.id === id ? mutate(thread) : thread)),
         store.value.active,
       )
     }
@@ -219,8 +227,6 @@ export default Plugin.define({
     const newThread = (): Thread => {
       const thread: Thread = { id: uid(), title: "New thread", updated: Date.now(), messages: [] }
       writeThreads([...store.value.threads, thread], thread.id)
-      setLiveText("")
-      setLiveReasoning("")
       setPending([])
       return thread
     }
@@ -233,28 +239,29 @@ export default Plugin.define({
 
     const selectThread = (id: string) => {
       writeThreads(store.value.threads, id)
-      setLiveText("")
-      setLiveReasoning("")
     }
 
-    const addFiles = async (files: FileList | null) => {
-      if (!files) return
+    const addFilesNow = async (files: FileList) => {
       const accepted: Attachment[] = []
-      let total = pending().reduce((sum, file) => sum + file.data.length, 0)
+      let total = pending().reduce((sum, file) => sum + rawSize(file.data), 0)
 
       for (const file of Array.from(files)) {
         if (pending().length + accepted.length >= MAX_FILES) {
           ctx.toast.show({ title: ctx.t("title"), description: ctx.t("tooMany"), variant: "error" })
           break
         }
-        if (file.size > MAX_ATTACHMENT_BYTES || total + file.size > MAX_TOTAL_BYTES) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
           ctx.toast.show({ title: ctx.t("title"), description: `${ctx.t("tooBig")} (${file.name})`, variant: "error" })
           continue
+        }
+        if (total + file.size > MAX_TOTAL_BYTES) {
+          ctx.toast.show({ title: ctx.t("title"), description: ctx.t("tooLarge"), variant: "error" })
+          break
         }
         try {
           const attachment = await readFile(file)
           accepted.push(attachment)
-          total += attachment.data.length
+          total += rawSize(attachment.data)
         } catch {
           ctx.toast.show({ title: ctx.t("title"), description: `${ctx.t("readFailed")} (${file.name})`, variant: "error" })
         }
@@ -263,17 +270,24 @@ export default Plugin.define({
       if (accepted.length > 0) setPending((previous) => [...previous, ...accepted])
     }
 
+    let queue: Promise<void> = Promise.resolve()
+    const addFiles = (files: FileList | null) => {
+      if (!files || files.length === 0) return
+      const batch = files
+      queue = queue.then(() => addFilesNow(batch)).catch(() => {})
+    }
+
     client.on("delta", (event) => {
-      if (event.threadID === store.value.active) setLiveText(liveText() + event.text)
+      patchLive(event.threadID, (value) => ({ ...value, text: value.text + event.text }))
     })
     client.on("reasoning", (event) => {
-      if (event.threadID === store.value.active) setLiveReasoning(liveReasoning() + event.text)
+      patchLive(event.threadID, (value) => ({ ...value, reasoning: value.reasoning + event.text }))
     })
 
     const send = async () => {
       const text = draft().trim()
       const files = pending()
-      if (busyHere() || (!text && files.length === 0)) return
+      if (busyOf(activeID()) || (!text && files.length === 0)) return
 
       const thread = active() ?? newThread()
       const threadID = thread.id
@@ -289,9 +303,8 @@ export default Plugin.define({
 
       setDraft("")
       setPending([])
-      setLiveText("")
-      setLiveReasoning("")
-      setBusyID(threadID)
+      patchLive(threadID, () => ({ text: "", reasoning: "" }))
+      setBusyOf(threadID, true)
 
       let reply = ""
       let reasoning = ""
@@ -308,9 +321,8 @@ export default Plugin.define({
         reply = `Error: ${String(error)}`
       }
 
-      setLiveText("")
-      setLiveReasoning("")
-      setBusyID("")
+      patchLive(threadID, () => ({ text: "", reasoning: "" }))
+      setBusyOf(threadID, false)
 
       if (reply) {
         updateThread(threadID, (current) => ({
@@ -322,14 +334,9 @@ export default Plugin.define({
     }
 
     const stop = () => {
-      const id = busyID()
-      if (!id) return
-      void client
-        .cancel({ threadID: id })
-        .then((stopped) => {
-          if (!stopped) ctx.toast.show({ title: ctx.t("title"), description: ctx.t("busy") })
-        })
-        .catch(() => {})
+      const id = activeID()
+      if (!id || !busyOf(id)) return
+      void client.cancel({ threadID: id }).catch(() => {})
     }
 
     const open = () => {
@@ -338,17 +345,218 @@ export default Plugin.define({
         ctx.toast.show({ title: ctx.t("title"), description: ctx.t("needsSession"), variant: "error" })
         return
       }
-      ctx.layout.open(tabKey(), session, { tab: "open" })
-    }
+      ctx.dialogs.open((dialog) => {
+        let picker: HTMLInputElement | undefined
+        let scroller: HTMLDivElement | undefined
 
-    // One stable tab object: the host re-renders labels for a new object.
-    const tab = {
-      id: TAB_ID,
-      title: ctx.t("title"),
-      pinned: true,
-      closable: false,
-      fallback: true,
-    } as const
+        const scrollDown = () => {
+          if (scroller) scroller.scrollTop = scroller.scrollHeight
+        }
+
+        createEffect(() => {
+          liveOf(activeID()).text
+          liveOf(activeID()).reasoning
+          active()?.messages.length
+          scrollDown()
+        })
+
+        return (
+          <div
+            style={{
+              display: "flex",
+              width: "920px",
+              "max-width": "92vw",
+              height: "640px",
+              "max-height": "80vh",
+              "border-radius": "12px",
+              overflow: "hidden",
+            }}
+          >
+            {/* threads */}
+            <aside
+              style={{
+                width: "220px",
+                "flex-shrink": 0,
+                display: "flex",
+                "flex-direction": "column",
+                "border-right": "1px solid rgba(127,127,127,0.2)",
+                background: "rgba(127,127,127,0.04)",
+              }}
+            >
+              <div style={{ display: "flex", gap: "4px", padding: "8px", "border-bottom": "1px solid rgba(127,127,127,0.2)" }}>
+                <ctx.ui.Button variant="contrast" onClick={newThread}>
+                  {ctx.t("newThread")}
+                </ctx.ui.Button>
+                <ctx.ui.IconButton icon="trash" label={ctx.t("deleteThread")} disabled={!active()} onClick={deleteThread} />
+              </div>
+              <div style={{ flex: 1, "overflow-y": "auto", padding: "6px" }}>
+                <For each={threads()}>
+                  {(thread: Thread) => (
+                    <button
+                      type="button"
+                      onClick={() => selectThread(thread.id)}
+                      style={{
+                        display: "block",
+                        width: "100%",
+                        "text-align": "left",
+                        padding: "6px 8px",
+                        "margin-bottom": "2px",
+                        border: "none",
+                        "border-radius": "6px",
+                        cursor: "pointer",
+                        background: thread.id === store.value.active ? "rgba(127,127,127,0.18)" : "transparent",
+                        color: "inherit",
+                        font: "inherit",
+                        "font-size": "13px",
+                        "white-space": "nowrap",
+                        overflow: "hidden",
+                        "text-overflow": "ellipsis",
+                      }}
+                    >
+                      {thread.title}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </aside>
+
+            {/* chat */}
+            <main style={{ flex: 1, display: "flex", "flex-direction": "column", "min-width": "0" }}>
+              <header
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  padding: "8px 12px",
+                  "border-bottom": "1px solid rgba(127,127,127,0.2)",
+                  gap: "8px",
+                }}
+              >
+                <div style={{ "font-weight": 600 }}>{active()?.title ?? ctx.t("title")}</div>
+                <div style={{ flex: 1 }} />
+                <ctx.ui.Button variant="ghost" onClick={dialog.close}>
+                  {ctx.t("stop") === "Stop" ? "Close" : "Close"}
+                </ctx.ui.Button>
+              </header>
+
+              <div ref={(element) => (scroller = element)} style={{ flex: 1, "overflow-y": "auto", padding: "12px", display: "flex", "flex-direction": "column", gap: "14px" }}>
+                <Show
+                  when={(active()?.messages.length ?? 0) > 0 || liveOf(activeID()).text || liveOf(activeID()).reasoning}
+                  fallback={<div style={{ opacity: 0.6 }}>{ctx.t("empty")}</div>}
+                >
+                  <For each={active()?.messages ?? []}>
+                    {(message) => (
+                      <div>
+                        <div style={{ opacity: 0.55, "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.04em", "margin-bottom": "4px" }}>
+                          {message.role}
+                        </div>
+                        <Show when={message.files.length > 0}>
+                          <div style={{ display: "flex", gap: "6px", "flex-wrap": "wrap", "margin-bottom": "6px" }}>
+                            <For each={message.files}>{(name) => <Chip label={name} />}</For>
+                          </div>
+                        </Show>
+                        <Show
+                          when={message.role === "assistant"}
+                          fallback={<div style={{ "white-space": "pre-wrap" }}>{message.content}</div>}
+                        >
+                          <ctx.ui.Markdown text={message.content} />
+                        </Show>
+                        <Show when={message.reasoning}>
+                          <Thinking text={message.reasoning} label={ctx.t("thinking")} />
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+
+                  <Show when={busyOf(activeID())}>
+                    <div>
+                      <div style={{ opacity: 0.55, "font-size": "11px", "text-transform": "uppercase" }}>assistant</div>
+                      <Show when={liveOf(activeID()).reasoning}>
+                        <div style={{ opacity: 0.5, "font-size": "12px", "white-space": "pre-wrap" }}>
+                          {liveOf(activeID()).reasoning}
+                        </div>
+                      </Show>
+                      <Show when={liveOf(activeID()).text} fallback={<div style={{ opacity: 0.6 }}>{ctx.t("busy")}</div>}>
+                        <div style={{ "white-space": "pre-wrap" }}>{liveOf(activeID()).text}</div>
+                      </Show>
+                    </div>
+                  </Show>
+                </Show>
+              </div>
+
+              <Show when={pending().length > 0}>
+                <div style={{ display: "flex", gap: "6px", "flex-wrap": "wrap", padding: "6px 12px" }}>
+                  <For each={pending()}>
+                    {(file, index) => (
+                      <Show when={file.mime.startsWith("image/")} fallback={<Chip label={file.name} onRemove={() => setPending(pending().filter((_, at) => at !== index()))} />}>
+                        <img
+                          src={dataUrl(file)}
+                          alt={file.name}
+                          style={{ height: "48px", "border-radius": "6px", border: "1px solid rgba(127,127,127,0.3)" }}
+                        />
+                      </Show>
+                    )}
+                  </For>
+                </div>
+              </Show>
+
+              <div style={{ display: "flex", gap: "8px", "align-items": "flex-end", padding: "10px 12px" }}>
+                <input
+                  ref={(element) => (picker = element)}
+                  type="file"
+                  multiple
+                  style={{ display: "none" }}
+                  onChange={(event) => {
+                    addFiles(event.currentTarget.files)
+                    event.currentTarget.value = ""
+                  }}
+                />
+                <ctx.ui.IconButton icon="open-file" label={ctx.t("attach")} variant="neutral" onClick={() => picker?.click()} />
+                <textarea
+                  value={draft()}
+                  rows={3}
+                  placeholder={ctx.t("placeholder")}
+                  aria-label={ctx.t("placeholder")}
+                  onInput={(event) => setDraft(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault()
+                      void send()
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    addFiles(event.dataTransfer?.files ?? null)
+                  }}
+                  style={{
+                    flex: 1,
+                    resize: "none",
+                    background: "transparent",
+                    color: "inherit",
+                    border: "1px solid rgba(127,127,127,0.25)",
+                    "border-radius": "8px",
+                    padding: "8px 10px",
+                    font: "inherit",
+                    "min-height": "60px",
+                  }}
+                />
+                <Show
+                  when={busyOf(activeID())}
+                  fallback={
+                    <ctx.ui.Button variant="contrast" onClick={() => void send()}>
+                      {ctx.t("send")}
+                    </ctx.ui.Button>
+                  }
+                >
+                  <ctx.ui.Button variant="danger" onClick={stop}>
+                    {ctx.t("stop")}
+                  </ctx.ui.Button>
+                </Show>
+              </div>
+            </main>
+          </div>
+        )
+      }, { replace: true })
+    }
 
     ctx.add(Command, {
       id: "open",
@@ -375,188 +583,6 @@ export default Plugin.define({
       keybind: `${ctx.id}.open`,
       order: 10,
       run: () => open(),
-    })
-
-    ctx.add(Panel, {
-      id: TAB_ID,
-      region: "side",
-      list: () => [tab],
-      render: () => {
-        let picker: HTMLInputElement | undefined
-
-        return (
-          <div style={{ display: "flex", "flex-direction": "column", height: "100%", "min-height": "0" }}>
-            <div
-              style={{
-                display: "flex",
-                gap: "4px",
-                "align-items": "center",
-                padding: "6px 8px",
-                "border-bottom": "1px solid rgba(127,127,127,0.2)",
-              }}
-            >
-              <select
-                value={store.value.active}
-                onChange={(event) => selectThread(event.currentTarget.value)}
-                aria-label={ctx.t("title")}
-                style={{
-                  flex: 1,
-                  "min-width": "0",
-                  background: "Canvas",
-                  color: "CanvasText",
-                  border: "1px solid rgba(127,127,127,0.25)",
-                  "border-radius": "6px",
-                  padding: "4px 6px",
-                  font: "inherit",
-                }}
-              >
-                <Show when={threads().length === 0}>
-                  <option value="">No threads</option>
-                </Show>
-                <For each={threads()}>
-                  {(thread) => (
-                    <option value={thread.id} selected={thread.id === store.value.active}>
-                      {thread.title}
-                    </option>
-                  )}
-                </For>
-              </select>
-              <ctx.ui.IconButton icon="plus" label={ctx.t("newThread")} onClick={newThread} />
-              <ctx.ui.IconButton icon="trash" label={ctx.t("deleteThread")} disabled={!active()} onClick={deleteThread} />
-            </div>
-
-            <div
-              style={{
-                flex: 1,
-                "overflow-y": "auto",
-                padding: "8px",
-                display: "flex",
-                "flex-direction": "column",
-                gap: "12px",
-                "min-height": "0",
-              }}
-            >
-              <Show
-                when={(active()?.messages.length ?? 0) > 0 || liveText() || liveReasoning()}
-                fallback={<div style={{ opacity: 0.6 }}>{ctx.t("empty")}</div>}
-              >
-                <For each={active()?.messages ?? []}>
-                  {(message) => (
-                    <div>
-                      <div
-                        style={{
-                          opacity: 0.55,
-                          "font-size": "11px",
-                          "text-transform": "uppercase",
-                          "letter-spacing": "0.04em",
-                          "margin-bottom": "2px",
-                        }}
-                      >
-                        {message.role}
-                      </div>
-                      <Show when={message.files.length > 0}>
-                        <div style={{ display: "flex", gap: "4px", "flex-wrap": "wrap", "margin-bottom": "4px" }}>
-                          <For each={message.files}>{(name) => <Chip label={name} />}</For>
-                        </div>
-                      </Show>
-                      <Show
-                        when={message.role === "assistant"}
-                        fallback={<div style={{ "white-space": "pre-wrap" }}>{message.content}</div>}
-                      >
-                        <ctx.ui.Markdown text={message.content} />
-                      </Show>
-                      <Show when={message.reasoning}>
-                        <Thinking text={message.reasoning} label={ctx.t("thinking")} />
-                      </Show>
-                    </div>
-                  )}
-                </For>
-
-                <Show when={busyHere()}>
-                  <div>
-                    <div style={{ opacity: 0.55, "font-size": "11px", "text-transform": "uppercase" }}>assistant</div>
-                    <Show when={liveReasoning()}>
-                      <div style={{ opacity: 0.5, "font-size": "12px", "white-space": "pre-wrap" }}>{liveReasoning()}</div>
-                    </Show>
-                    <Show when={liveText()} fallback={<div style={{ opacity: 0.6 }}>{ctx.t("busy")}</div>}>
-                      <div style={{ "white-space": "pre-wrap" }}>{liveText()}</div>
-                    </Show>
-                  </div>
-                </Show>
-              </Show>
-            </div>
-
-            <Show when={pending().length > 0}>
-              <div style={{ display: "flex", gap: "4px", "flex-wrap": "wrap", padding: "0 8px 6px" }}>
-                <For each={pending()}>
-                  {(file, index) => (
-                    <Chip label={file.name} onRemove={() => setPending(pending().filter((_, at) => at !== index()))} />
-                  )}
-                </For>
-              </div>
-            </Show>
-
-            <div style={{ display: "flex", gap: "6px", "align-items": "flex-end", padding: "8px" }}>
-              <input
-                ref={(element) => (picker = element)}
-                type="file"
-                multiple
-                style={{ display: "none" }}
-                onChange={(event) => {
-                  void addFiles(event.currentTarget.files)
-                  event.currentTarget.value = ""
-                }}
-              />
-              <ctx.ui.IconButton
-                icon="open-file"
-                label={ctx.t("attach")}
-                variant="neutral"
-                onClick={() => picker?.click()}
-              />
-              <textarea
-                value={draft()}
-                rows={2}
-                placeholder={ctx.t("placeholder")}
-                aria-label={ctx.t("placeholder")}
-                onInput={(event) => setDraft(event.currentTarget.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault()
-                    void send()
-                  }
-                }}
-                onDrop={(event) => {
-                  event.preventDefault()
-                  void addFiles(event.dataTransfer?.files ?? null)
-                }}
-                style={{
-                  flex: 1,
-                  resize: "none",
-                  background: "transparent",
-                  color: "inherit",
-                  border: "1px solid rgba(127,127,127,0.25)",
-                  "border-radius": "8px",
-                  padding: "6px 8px",
-                  font: "inherit",
-                  "min-height": "40px",
-                }}
-              />
-              <Show
-                when={busyHere()}
-                fallback={
-                  <ctx.ui.Button variant="contrast" onClick={() => void send()}>
-                    {ctx.t("send")}
-                  </ctx.ui.Button>
-                }
-              >
-                <ctx.ui.Button variant="danger" onClick={stop}>
-                  {ctx.t("stop")}
-                </ctx.ui.Button>
-              </Show>
-            </div>
-          </div>
-        )
-      },
     })
 
     ctx.add(SettingsPage, {
@@ -613,7 +639,8 @@ export default Plugin.define({
         )
 
         const last = messages.at(-1)
-        const content = prepared.parts.length > 0 ? [{ type: "text", text: prepared.text }, ...prepared.parts] : prepared.text
+        const content =
+          prepared.parts.length > 0 ? [{ type: "text", text: prepared.text }, ...prepared.parts] : prepared.text
         const history = last ? [...messages.slice(0, -1), { role: last.role, content }] : messages
 
         const slot = `${caller.window}:${threadID}`
@@ -625,6 +652,18 @@ export default Plugin.define({
         let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
         let text = ""
         let reasoning = ""
+
+        const apply = (delta: Delta) => {
+          if (delta.error) throw new Error(delta.error)
+          if (delta.reasoning) {
+            reasoning += delta.reasoning
+            emitReasoning({ threadID, text: delta.reasoning }, caller.window)
+          }
+          if (delta.content) {
+            text += delta.content
+            emitDelta({ threadID, text: delta.content }, caller.window)
+          }
+        }
 
         try {
           const response = await fetch(`${endpoint()}/v1/chat/completions`, {
@@ -639,7 +678,7 @@ export default Plugin.define({
 
           reader = response.body.getReader()
           const decoder = new TextDecoder()
-          let buffer = ""
+          let carry = ""
           let raw = ""
 
           while (true) {
@@ -647,25 +686,20 @@ export default Plugin.define({
             if (chunk.done) break
             const piece = decoder.decode(chunk.value, { stream: true })
             raw += piece
-            buffer += piece
-            const { frames, rest } = splitFrames(buffer)
-            buffer = rest
-            for (const frame of frames) {
-              for (const payload of framePayloads(frame)) {
-                const delta = readDelta(payload)
-                if (delta.reasoning) {
-                  reasoning += delta.reasoning
-                  emitReasoning({ threadID, text: delta.reasoning }, caller.window)
-                }
-                if (delta.content) {
-                  text += delta.content
-                  emitDelta({ threadID, text: delta.content }, caller.window)
-                }
-              }
-            }
+            const step = readChunk(carry, piece)
+            carry = step.rest
+            for (const delta of step.deltas) apply(delta)
           }
 
-          // An upstream that ignores `stream` answers with one JSON body and no frames.
+          const tail = decoder.decode()
+          if (tail) {
+            raw += tail
+            const step = readChunk(carry, tail)
+            carry = step.rest
+            for (const delta of step.deltas) apply(delta)
+          }
+          for (const delta of flushChunk(carry)) apply(delta)
+
           if (!text) {
             const fallback = readMessage(raw)
             if (fallback) {
