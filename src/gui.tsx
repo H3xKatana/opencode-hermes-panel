@@ -175,6 +175,8 @@ export default Plugin.define({
       attach: "Attach image or file",
       placeholder: "Ask Hermes…",
       empty: "Start a thread. Attach images or files with the paperclip.",
+      close: "Close",
+      shortcut: "Ctrl+Shift+H",
       busy: "Hermes is thinking…",
       thinking: "Reasoning",
       needsSession: "Open a session first.",
@@ -340,11 +342,6 @@ export default Plugin.define({
     }
 
     const open = () => {
-      const session = ctx.sessions.current()
-      if (!session) {
-        ctx.toast.show({ title: ctx.t("title"), description: ctx.t("needsSession"), variant: "error" })
-        return
-      }
       ctx.dialogs.open((dialog) => {
         let picker: HTMLInputElement | undefined
         let scroller: HTMLDivElement | undefined
@@ -434,14 +431,19 @@ export default Plugin.define({
                 <div style={{ "font-weight": 600 }}>{active()?.title ?? ctx.t("title")}</div>
                 <div style={{ flex: 1 }} />
                 <ctx.ui.Button variant="ghost" onClick={dialog.close}>
-                  {ctx.t("stop") === "Stop" ? "Close" : "Close"}
+                  {ctx.t("close")}
                 </ctx.ui.Button>
               </header>
 
               <div ref={(element) => (scroller = element)} style={{ flex: 1, "overflow-y": "auto", padding: "12px", display: "flex", "flex-direction": "column", gap: "14px" }}>
                 <Show
                   when={(active()?.messages.length ?? 0) > 0 || liveOf(activeID()).text || liveOf(activeID()).reasoning}
-                  fallback={<div style={{ opacity: 0.6 }}>{ctx.t("empty")}</div>}
+                  fallback={
+                    <div style={{ opacity: 0.6, display: "flex", "flex-direction": "column", gap: "4px" }}>
+                      <div>{ctx.t("empty")}</div>
+                      <div style={{ "font-size": "11px" }}>Shortcut: {ctx.t("shortcut")}</div>
+                    </div>
+                  }
                 >
                   <For each={active()?.messages ?? []}>
                     {(message) => (
