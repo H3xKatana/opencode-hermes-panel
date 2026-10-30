@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { Command, Ipc, MenuItem, Plugin, SettingsPage, Store } from "@opencode/plugin/gui"
+import { Command, Ipc, MenuItem, Panel, Plugin, SettingsPage, Store } from "@opencode/plugin/gui"
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
 import {
   MAX_ATTACHMENT_BYTES,
@@ -16,6 +16,7 @@ import {
   type Delta,
 } from "./chat"
 
+const TAB_ID = "main"
 const DEFAULT_ENDPOINT = "https://katana-eu-hermes.hawiyat.cloud"
 
 // ---------------------------------------------------------------- schemas
@@ -175,8 +176,6 @@ export default Plugin.define({
       attach: "Attach image or file",
       placeholder: "Ask Hermes…",
       empty: "Start a thread. Attach images or files with the paperclip.",
-      close: "Close",
-      shortcut: "Ctrl+Shift+H",
       busy: "Hermes is thinking…",
       thinking: "Reasoning",
       needsSession: "Open a session first.",
@@ -186,6 +185,8 @@ export default Plugin.define({
       tooMany: "Too many attachments.",
       readFailed: "Could not read the file.",
       emptyReply: "Hermes returned an empty reply.",
+      close: "Close",
+      shortcut: "Ctrl+Shift+H",
     },
   },
 
@@ -195,6 +196,7 @@ export default Plugin.define({
 
     const endpoint = () => String(ctx.options.endpoint ?? DEFAULT_ENDPOINT)
     const key = () => String(ctx.options.key ?? "")
+    const tabKey = () => `${ctx.id}:${TAB_ID}`
     const store = ctx.stores.chat
 
     const [draft, setDraft] = createSignal("")
@@ -341,7 +343,7 @@ export default Plugin.define({
       void client.cancel({ threadID: id }).catch(() => {})
     }
 
-    const open = () => {
+    const openDialog = () => {
       ctx.dialogs.open((dialog) => {
         let picker: HTMLInputElement | undefined
         let scroller: HTMLDivElement | undefined
@@ -369,7 +371,6 @@ export default Plugin.define({
               overflow: "hidden",
             }}
           >
-            {/* threads */}
             <aside
               style={{
                 width: "220px",
@@ -417,7 +418,6 @@ export default Plugin.define({
               </div>
             </aside>
 
-            {/* chat */}
             <main style={{ flex: 1, display: "flex", "flex-direction": "column", "min-width": "0" }}>
               <header
                 style={{
@@ -446,7 +446,7 @@ export default Plugin.define({
                   }
                 >
                   <For each={active()?.messages ?? []}>
-                    {(message) => (
+                    {(message: Message) => (
                       <div>
                         <div style={{ opacity: 0.55, "font-size": "11px", "text-transform": "uppercase", "letter-spacing": "0.04em", "margin-bottom": "4px" }}>
                           {message.role}
@@ -488,8 +488,11 @@ export default Plugin.define({
               <Show when={pending().length > 0}>
                 <div style={{ display: "flex", gap: "6px", "flex-wrap": "wrap", padding: "6px 12px" }}>
                   <For each={pending()}>
-                    {(file, index) => (
-                      <Show when={file.mime.startsWith("image/")} fallback={<Chip label={file.name} onRemove={() => setPending(pending().filter((_, at) => at !== index()))} />}>
+                    {(file: Attachment, index) => (
+                      <Show
+                        when={file.mime.startsWith("image/")}
+                        fallback={<Chip label={file.name} onRemove={() => setPending(pending().filter((_, at) => at !== index()))} />}
+                      >
                         <img
                           src={dataUrl(file)}
                           alt={file.name}
@@ -560,6 +563,17 @@ export default Plugin.define({
       }, { replace: true })
     }
 
+    const open = () => openDialog()
+
+    // Keep a pinned tab in the side strip so Hermes is always discoverable; clicking it opens the dialog.
+    const tab = {
+      id: TAB_ID,
+      title: ctx.t("title"),
+      pinned: true,
+      closable: false,
+      fallback: true,
+    } as const
+
     ctx.add(Command, {
       id: "open",
       get title() {
@@ -572,7 +586,7 @@ export default Plugin.define({
       bind: "mod+shift+h",
       featured: true,
       suggested: true,
-      run: () => open(),
+      run: () => openDialog(),
     })
 
     ctx.add(MenuItem, {
@@ -584,7 +598,34 @@ export default Plugin.define({
       icon: "speech-bubble",
       keybind: `${ctx.id}.open`,
       order: 10,
-      run: () => open(),
+      run: () => openDialog(),
+    })
+
+    ctx.add(Panel, {
+      id: TAB_ID,
+      region: "side",
+      wide: true,
+      list: () => [tab],
+      render: () => (
+        <div
+          style={{
+            display: "flex",
+            "flex-direction": "column",
+            "align-items": "center",
+            "justify-content": "center",
+            height: "100%",
+            gap: "8px",
+            padding: "12px",
+            opacity: 0.8,
+          }}
+        >
+          <div style={{ "font-weight": 600 }}>{ctx.t("title")}</div>
+          <ctx.ui.Button variant="contrast" onClick={openDialog}>
+            {ctx.t("open")}
+          </ctx.ui.Button>
+          <div style={{ "font-size": "11px", opacity: 0.6 }}>{ctx.t("shortcut")}</div>
+        </div>
+      ),
     })
 
     ctx.add(SettingsPage, {
@@ -604,7 +645,7 @@ export default Plugin.define({
             {JSON.stringify({ endpoint: endpoint(), key: key() ? "***" : "(unset)" }, null, 2)}
           </pre>
           <div>
-            <ctx.ui.Button onClick={open}>{ctx.t("open")}</ctx.ui.Button>
+            <ctx.ui.Button onClick={openDialog}>{ctx.t("open")}</ctx.ui.Button>
           </div>
         </div>
       ),
